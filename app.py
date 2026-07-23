@@ -9,6 +9,9 @@ from PIL import Image
 
 app = Flask(__name__)
 
+# Cap uploads so a huge file can't exhaust a t3.micro's memory (1 GB RAM).
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
+
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 BUCKET = os.environ.get("BUCKET_NAME")  # set on the EC2 instance via docker -e
 
@@ -96,6 +99,8 @@ def strip_metadata(raw):
 
     clean = Image.new(img.mode, img.size)
     clean.putdata(list(img.getdata()))
+    if img.mode == "P":  # palette images: carry the colour table, not just indices
+        clean.putpalette(img.getpalette())
 
     out = io.BytesIO()
     save_fmt = "JPEG" if fmt in ("JPG", "JPEG", "MPO") else fmt
@@ -105,6 +110,11 @@ def strip_metadata(raw):
         clean.save(out, format=save_fmt)
     out.seek(0)
     return out.read(), save_fmt
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"error": "File too large (25 MB max)"}), 413
 
 
 @app.route("/health")

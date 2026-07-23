@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 *.pem
 .env
+
+# Deploy-time artifacts (generated locally by deploy.ps1 — never push these)
+state.env
+userdata.sh
+cf-config.json
+cf-disable.json
+lifecycle.json
+s3policy.json
+trust.json
