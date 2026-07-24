@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pem
 .env
+implementation.md
 
 # Deploy-time artifacts (generated locally by deploy.ps1 — never push these)
 state.env
