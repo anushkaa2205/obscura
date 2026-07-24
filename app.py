@@ -148,21 +148,26 @@ def strip():
     key = f"clean/{uuid.uuid4().hex}.{ext}"  # random, unguessable
     orig_name = os.path.splitext(os.path.basename(f.filename or "photo"))[0]
 
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=clean_bytes,
-        ContentType=f"image/{ext}",
-    )
-    download_url = s3.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": BUCKET,
-            "Key": key,
-            "ResponseContentDisposition": f'attachment; filename="obscura_{orig_name}.{ext}"',
-        },
-        ExpiresIn=300,  # link dies in 5 minutes
-    )
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=clean_bytes,
+            ContentType=f"image/{ext}",
+        )
+        download_url = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": BUCKET,
+                "Key": key,
+                "ResponseContentDisposition": f'attachment; filename="obscura_{orig_name}.{ext}"',
+            },
+            ExpiresIn=900,  # 15 min — was 5, too easy to let the link go stale mid-demo
+        )
+    except Exception as e:
+        # Surface a clean JSON error instead of letting the browser hit a raw
+        # AWS XML page if S3 is unreachable or the presigned URL fails to build.
+        return jsonify({"error": f"Upload to storage failed: {e}"}), 502
 
     # NOTE: we deliberately never log `found` — that would leak GPS into CloudWatch.
     return jsonify(
