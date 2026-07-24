@@ -127,6 +127,20 @@ def too_large(_e):
     return jsonify({"error": "File too large (25 MB max)"}), 413
 
 
+def summarize_findings(found):
+    """
+    Never send the actual sensitive values to the browser - only which
+    categories of metadata were present. Rendering the real GPS coordinates,
+    exact timestamp, or device model on screen (even briefly, even struck
+    through) is itself an exposure: screen recording, shoulder-surfing, or a
+    glance at the browser's Network tab would all still see it. This keeps
+    the "we never log your metadata" promise consistent end-to-end - the
+    real values live only in server memory for the split second it takes to
+    strip them, and never reach the client at all.
+    """
+    return {k: "found — redacted" for k in found if not k.startswith("_")}
+
+
 @app.route("/health")
 def health():
     # The ALB target group pings this. Must return 200.
@@ -180,9 +194,10 @@ def strip():
         return jsonify({"error": f"Upload to storage failed: {e}"}), 502
 
     # NOTE: we deliberately never log `found` — that would leak GPS into CloudWatch.
+    # We also never send the real values to the browser — see summarize_findings.
     return jsonify(
         {
-            "found": found,
+            "found": summarize_findings(found),
             "stripped_count": total,
             "download_url": download_url,
         }
