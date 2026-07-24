@@ -119,8 +119,7 @@
   </div>
 
   <footer>
-    Processed in memory · cleaned copy auto-deletes within 24h · we never log your metadata<br/>
-    Obscura · AWS cloud project · VPC · EC2 · S3 · IAM · ALB · CloudFront
+    Processed in memory · cleaned copy auto-deletes within 24h · we never log your metadata
   </footer>
 
 <script>
@@ -163,15 +162,12 @@
       d.innerHTML='<span class="k">result</span><span class="v">No metadata found — already clean</span>';
       rows.appendChild(d);
     }
+    // The server only ever sends "found — redacted" per category, never the
+    // real GPS/timestamp/device values (and no map link) - so nothing
+    // sensitive is ever rendered in the DOM, cached, or visible on screen.
     entries.forEach(([k,v],i)=>{
       const d=document.createElement("div"); d.className="row"; d.style.animationDelay=(i*0.09)+"s";
-      let val=v;
-      if(k==="GPS location" && data.found._gps){
-        const g=data.found._gps;
-        val=`${v} <a class="maplink" target="_blank" rel="noopener"
-             href="https://www.openstreetmap.org/?mlat=${g.lat}&mlon=${g.lon}#map=15/${g.lat}/${g.lon}">view where →</a>`;
-      }
-      d.innerHTML=`<span class="k">${k}</span><span class="v">${val}</span>`;
+      d.innerHTML=`<span class="k">${k}</span><span class="v">${v}</span>`;
       rows.appendChild(d);
     });
 
