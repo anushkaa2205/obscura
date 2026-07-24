@@ -94,19 +94,23 @@ def read_metadata(raw):
 
 def strip_metadata(raw):
     """
-    Bulletproof strip: decode to raw pixels, re-encode into a brand-new image.
-    No EXIF, no GPS, no thumbnails, no maker notes can survive this.
+    Bulletproof strip: copy the image (PIL's fast internal pixel copy) and
+    wipe .info, which is where PIL sources EXIF/ICC profile/comments/thumbnails
+    for every format on save. Equivalent guarantee to rebuilding pixel-by-pixel,
+    but avoids materializing a Python list of every pixel as a tuple - which
+    was slow/heavy enough on real 12-50MP phone photos to time out or exhaust
+    memory on a t3.micro (the ALB then returns its own HTML error page instead
+    of JSON, which is what "Unexpected token '<'" in the UI means).
     Returns (clean_bytes, out_format).
     """
     img = Image.open(io.BytesIO(raw))
     fmt = (img.format or "JPEG").upper()
-    if fmt == "JPEG":
-        img = img.convert("RGB")
 
-    clean = Image.new(img.mode, img.size)
-    clean.putdata(list(img.getdata()))
-    if img.mode == "P":  # palette images: carry the colour table, not just indices
-        clean.putpalette(img.getpalette())
+    clean = img.copy()
+    clean.info = {}  # drops exif, icc_profile, comment, dpi, thumbnails, etc.
+
+    if fmt in ("JPEG", "JPG", "MPO") and clean.mode not in ("RGB", "L"):
+        clean = clean.convert("RGB")  # JPEG can't save RGBA/P/CMYK-with-alpha etc.
 
     out = io.BytesIO()
     save_fmt = "JPEG" if fmt in ("JPG", "JPEG", "MPO") else fmt
