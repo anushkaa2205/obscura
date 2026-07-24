@@ -16,7 +16,13 @@ REGION = os.environ.get("AWS_REGION", "ap-south-1")
 BUCKET = os.environ.get("BUCKET_NAME")  # set on the EC2 instance via docker -e
 
 # boto3 automatically uses the EC2 instance's IAM role — no keys stored anywhere.
-s3 = boto3.client("s3", region_name=REGION)
+# endpoint_url is pinned to the regional S3 endpoint: without it, this botocore
+# version signs presigned URLs against the global s3.amazonaws.com host, which
+# 307-redirects non-us-east-1 buckets to the regional host and breaks the
+# signature (Host is a signed header) - the download link 403s for every user.
+s3 = boto3.client(
+    "s3", region_name=REGION, endpoint_url=f"https://s3.{REGION}.amazonaws.com"
+)
 
 
 def _ratio(x):

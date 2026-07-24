@@ -22,6 +22,18 @@ $PEM         = Join-Path $PSScriptRoot "obscura-key.pem"
 # ---------------------------------------------------------------- helpers ----
 function Ok($v) { return ($v -ne $null) -and ("$v".Trim() -ne "") -and ("$v".Trim() -ne "None") }
 
+# Runs a read-only "does X already exist?" probe without letting a non-zero
+# exit code (e.g. NoSuchEntity on a fresh account) halt the whole script -
+# some PowerShell versions treat native-command stderr as a terminating error
+# even when it's redirected to $null.
+function Probe([scriptblock]$cmd) {
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $result = & $cmd 2>$null } catch { $result = $null }
+    $ErrorActionPreference = $prevEAP
+    return $result
+}
+
 # Ordered state; loaded from state.env if present so we can resume.
 $S = [ordered]@{
     VPC_ID=""; IGW_ID=""; SUBNET_A=""; SUBNET_B=""; RT_ID=""
@@ -142,7 +154,7 @@ Write-Host "BUCKET     = $($S.BUCKET)"
 $roleName    = "$PROJECT-ec2-role"
 $profileName = "$PROJECT-ec2-profile"
 $iamFresh = $false
-$roleExists = & aws iam get-role --role-name $roleName --query 'Role.RoleName' --output text 2>$null
+$roleExists = Probe { aws iam get-role --role-name $roleName --query 'Role.RoleName' --output text }
 if (-not (Ok $roleExists)) {
     @'
 {
@@ -169,18 +181,19 @@ if (-not (Ok $roleExists)) {
 & aws iam put-role-policy --role-name $roleName --policy-name s3-clean-access `
     --policy-document "file://$(Join-Path $PSScriptRoot 's3policy.json')" | Out-Null
 
-$profExists = & aws iam get-instance-profile --instance-profile-name $profileName --query 'InstanceProfile.InstanceProfileName' --output text 2>$null
+$profExists = Probe { aws iam get-instance-profile --instance-profile-name $profileName --query 'InstanceProfile.InstanceProfileName' --output text }
 if (-not (Ok $profExists)) {
     & aws iam create-instance-profile --instance-profile-name $profileName | Out-Null
     $iamFresh = $true
 }
-# Attach role to profile; ignore error if already attached.
-& aws iam add-role-to-instance-profile --instance-profile-name $profileName --role-name $roleName 2>$null | Out-Null
+# Attach role to profile; ignore error if already attached (this runs on every
+# re-run, so it must tolerate "already attached" without halting the script).
+Probe { aws iam add-role-to-instance-profile --instance-profile-name $profileName --role-name $roleName } | Out-Null
 if ($iamFresh) { Write-Host "Waiting 15s for IAM consistency..."; Start-Sleep -Seconds 15 }
 Write-Host "IAM        = $roleName / $profileName"
 
 # ------------------------------------------------------------- key pair ----
-$keyExists = & aws ec2 describe-key-pairs --key-names "$PROJECT-key" --query 'KeyPairs[0].KeyName' --output text 2>$null
+$keyExists = Probe { aws ec2 describe-key-pairs --key-names "$PROJECT-key" --query 'KeyPairs[0].KeyName' --output text }
 if ((Ok $keyExists) -and -not (Test-Path $PEM)) {
     # Key exists in AWS but we lost the private material - recreate it.
     Write-Host "Key exists without local .pem - recreating key pair." -ForegroundColor Yellow
@@ -221,7 +234,7 @@ docker run -d --restart always -p 8080:8080 \
 
 function Alive($id) {
     if (-not (Ok $id)) { return $false }
-    $st = & aws ec2 describe-instances --instance-ids $id --query 'Reservations[0].Instances[0].State.Name' --output text 2>$null
+    $st = Probe { aws ec2 describe-instances --instance-ids $id --query 'Reservations[0].Instances[0].State.Name' --output text }
     return ($st -eq 'pending' -or $st -eq 'running')
 }
 function Launch($subnet, $name) {
@@ -241,7 +254,7 @@ Write-Host "  (boot + docker build takes ~3-5 min before health checks pass)"
 
 # --------------------------------------------------------- target group ----
 if (-not (Has 'TG_ARN')) {
-    $existingTg = & aws elbv2 describe-target-groups --names "$PROJECT-tg" --query 'TargetGroups[0].TargetGroupArn' --output text 2>$null
+    $existingTg = Probe { aws elbv2 describe-target-groups --names "$PROJECT-tg" --query 'TargetGroups[0].TargetGroupArn' --output text }
     if (Ok $existingTg) { $S.TG_ARN = $existingTg }
 }
 if (-not (Has 'TG_ARN')) {
@@ -251,13 +264,21 @@ if (-not (Has 'TG_ARN')) {
         --query 'TargetGroups[0].TargetGroupArn' --output text
     Save-State
 }
-# register-targets is idempotent
-& aws elbv2 register-targets --target-group-arn $S.TG_ARN --targets Id=$($S.INST_A) Id=$($S.INST_B) 2>$null | Out-Null
-Write-Host "TG_ARN     = $($S.TG_ARN)"
+# register-targets is idempotent - but only register instances that actually
+# exist (an empty ID, e.g. because the second instance hit a quota error, is
+# an invalid target and AWS will reject the whole call).
+$targetIds = @($S.INST_A, $S.INST_B) | Where-Object { Ok $_ }
+if ($targetIds.Count -gt 0) {
+    $targetArgs = $targetIds | ForEach-Object { "Id=$_" }
+    Probe { aws elbv2 register-targets --target-group-arn $S.TG_ARN --targets $targetArgs } | Out-Null
+    Write-Host "TG_ARN     = $($S.TG_ARN)  (targets: $($targetIds -join ', '))"
+} else {
+    Write-Host "TG_ARN     = $($S.TG_ARN)  (no live instances to register yet)" -ForegroundColor Yellow
+}
 
 # ------------------------------------------------------------------ ALB ----
 if (-not (Has 'ALB_ARN')) {
-    $existingAlb = & aws elbv2 describe-load-balancers --names "$PROJECT-alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>$null
+    $existingAlb = Probe { aws elbv2 describe-load-balancers --names "$PROJECT-alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text }
     if (Ok $existingAlb) { $S.ALB_ARN = $existingAlb }
 }
 if (-not (Has 'ALB_ARN')) {
@@ -269,7 +290,7 @@ if (-not (Has 'ALB_ARN')) {
 $S.ALB_DNS = & aws elbv2 describe-load-balancers --load-balancer-arns $S.ALB_ARN --query 'LoadBalancers[0].DNSName' --output text
 Save-State
 # Ensure a listener exists (idempotent).
-$listener = & aws elbv2 describe-listeners --load-balancer-arn $S.ALB_ARN --query 'Listeners[0].ListenerArn' --output text 2>$null
+$listener = Probe { aws elbv2 describe-listeners --load-balancer-arn $S.ALB_ARN --query 'Listeners[0].ListenerArn' --output text }
 if (-not (Ok $listener)) {
     & aws elbv2 create-listener --load-balancer-arn $S.ALB_ARN --protocol HTTP --port 80 `
         --default-actions Type=forward,TargetGroupArn=$($S.TG_ARN) | Out-Null
@@ -278,7 +299,7 @@ Write-Host "ALB_DNS    = $($S.ALB_DNS)"
 
 # ----------------------------------------------------------- CloudFront ----
 if (-not (Has 'CF_ID')) {
-    $existingCf = & aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='Obscura CDN'].Id | [0]" --output text 2>$null
+    $existingCf = Probe { aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='Obscura CDN'].Id | [0]" --output text }
     if (Ok $existingCf) {
         $S.CF_ID = $existingCf
         $S.CF_DOMAIN = & aws cloudfront get-distribution --id $S.CF_ID --query 'Distribution.DomainName' --output text
@@ -320,11 +341,31 @@ if (-not (Has 'CF_ID')) {
 }
 "@ | Out-File (Join-Path $PSScriptRoot "cf-config.json") -Encoding ascii
 
-    $cfRaw = & aws cloudfront create-distribution --distribution-config "file://$(Join-Path $PSScriptRoot 'cf-config.json')"
-    $cf = ($cfRaw -join "") | ConvertFrom-Json
-    $S.CF_ID     = $cf.Distribution.Id
-    $S.CF_DOMAIN = $cf.Distribution.DomainName
-    Save-State
+    # Don't let a failed create-distribution (e.g. account not CloudFront-verified
+    # yet) kill the whole script - capture stderr ourselves and degrade gracefully,
+    # same as the "no CF yet" path below already does for the ALB lockdown.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $cfRaw = & aws cloudfront create-distribution --distribution-config "file://$(Join-Path $PSScriptRoot 'cf-config.json')" 2>&1
+    $cfExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+
+    if ($cfExit -ne 0) {
+        $cfErrText = ($cfRaw | Out-String)
+        if ($cfErrText -match 'AccessDenied' -and $cfErrText -match 'verified') {
+            Write-Host "CloudFront is blocked: this AWS account is not yet verified for CloudFront." -ForegroundColor Yellow
+            Write-Host "  -> Open a case with AWS Support asking to enable CloudFront for this account, then re-run ./deploy.ps1." -ForegroundColor Yellow
+            Write-Host "  Everything else is deployed and live over plain HTTP meanwhile: http://$($S.ALB_DNS)" -ForegroundColor Yellow
+        } else {
+            Write-Host "CloudFront create-distribution failed:" -ForegroundColor Red
+            Write-Host $cfErrText -ForegroundColor Red
+        }
+    } else {
+        $cf = ($cfRaw -join "") | ConvertFrom-Json
+        $S.CF_ID     = $cf.Distribution.Id
+        $S.CF_DOMAIN = $cf.Distribution.DomainName
+        Save-State
+    }
 }
 Write-Host "CF_ID      = $($S.CF_ID)"
 Write-Host "CF_DOMAIN  = $($S.CF_DOMAIN)"
@@ -332,22 +373,36 @@ Write-Host "CF_DOMAIN  = $($S.CF_DOMAIN)"
 # ------------------------------------------------- lock ALB to CloudFront ----
 # Note: CachePolicyId 4135ea2d... = managed CachingDisabled (dynamic app).
 #       OriginRequestPolicyId 216adef6... = managed AllViewer.
+# IMPORTANT: only lock the ALB down if CloudFront actually exists. Doing this
+# without a working distribution makes the app completely unreachable - the
+# ALB would only trust CloudFront's IPs, but nothing would be forwarding to it.
+if (-not (Has 'CF_ID')) {
+    Write-Host "Skipping ALB lockdown - no CloudFront distribution yet." -ForegroundColor Yellow
+    Write-Host "ALB stays open on port 80 so you can use/test it directly: http://$($S.ALB_DNS)" -ForegroundColor Yellow
+} else {
 $PL_ID = & aws ec2 describe-managed-prefix-lists `
     --filters "Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing" `
     --query 'PrefixLists[0].PrefixListId' --output text
 if (Ok $PL_ID) {
-    & aws ec2 authorize-security-group-ingress --group-id $S.ALB_SG `
-        --ip-permissions IpProtocol=tcp,FromPort=80,ToPort=80,PrefixListIds="[{PrefixListId=$PL_ID}]" 2>$null | Out-Null
-    & aws ec2 revoke-security-group-ingress --group-id $S.ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 2>$null | Out-Null
+    # Both run on every re-run too, so both must tolerate "already applied".
+    Probe { aws ec2 authorize-security-group-ingress --group-id $S.ALB_SG `
+        --ip-permissions IpProtocol=tcp,FromPort=80,ToPort=80,PrefixListIds="[{PrefixListId=$PL_ID}]" } | Out-Null
+    Probe { aws ec2 revoke-security-group-ingress --group-id $S.ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 } | Out-Null
     Write-Host "ALB locked to CloudFront prefix list $PL_ID"
+}
 }
 
 Save-State
 Write-Host ""
 Write-Host "======================================================================" -ForegroundColor Green
 Write-Host " Deploy complete. State saved to state.env" -ForegroundColor Green
-Write-Host " Live app (after CloudFront finishes ~5-10 min): https://$($S.CF_DOMAIN)" -ForegroundColor Green
+if (Has 'CF_DOMAIN') {
+    Write-Host " Live app (after CloudFront finishes ~5-10 min): https://$($S.CF_DOMAIN)" -ForegroundColor Green
+} else {
+    Write-Host " Live app (HTTP only - no CloudFront yet): http://$($S.ALB_DNS)" -ForegroundColor Green
+}
 Write-Host " Check target health:" -ForegroundColor Green
 Write-Host "   aws elbv2 describe-target-health --target-group-arn $($S.TG_ARN) --query 'TargetHealthDescriptions[].TargetHealth.State'" -ForegroundColor Green
 Write-Host " When finished, run:   ./cleanup.ps1" -ForegroundColor Green
 Write-Host "======================================================================" -ForegroundColor Green
+exit 0
