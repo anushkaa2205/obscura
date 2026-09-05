@@ -1,0 +1,30 @@
+# Files never to upload to Cloud Build. Without this file gcloud falls back to
+# .gitignore, which is close but not guaranteed — and the private key sitting in
+# this folder makes that not worth relying on.
+
+.git/
+.gitignore
+__pycache__/
+*.pyc
+
+# Private key for the EC2 key pair. Must never leave this machine.
+*.pem
+
+# AWS deploy tooling — irrelevant to the container, and state.env carries live
+# resource IDs for the account.
+*.ps1
+state.env
+userdata.sh
+cf-config.json
+cf-disable.json
+lifecycle.json
+s3policy.json
+trust.json
+
+implementation.md
+.claude/
+
+# Local scratch, not part of the app
+_to_delete/
+Claude outputs/
+test_strip.py

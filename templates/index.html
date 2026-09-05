@@ -136,21 +136,81 @@
   function show(el){el.classList.remove("hidden")}
   function hide(el){el.classList.add("hidden")}
 
+  // A request with no ceiling can only ever fail silently: the spinner keeps
+  // turning whether the server is working, wedged, or gone. Bound it, count the
+  // seconds out loud so a slow upload doesn't read as a hang, and say what
+  // actually went wrong when it doesn't come back.
+  const REQUEST_TIMEOUT_MS = 120000;
+  let ticker = null, objectUrl = null;
+
+  function stopTicker(){ if(ticker){ clearInterval(ticker); ticker = null; } }
+
   async function handle(f){
     reset();
     show(status);
-    status.innerHTML='<span class="spin"></span>Developing… reading what your camera hid';
-    const fd=new FormData(); fd.append("photo",f);
+
+    const startedAt = Date.now();
+    const paint = () => {
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      status.innerHTML = '<span class="spin"></span>Developing… reading what your camera hid'
+                       + (secs >= 3 ? ` · ${secs}s` : "");
+    };
+    paint();
+    ticker = setInterval(paint, 1000);
+
+    const ctrl = new AbortController();
+    const abortAt = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+
+    const fd = new FormData(); fd.append("photo", f);
     let data;
     try{
-      const r=await fetch("/strip",{method:"POST",body:fd});
-      data=await r.json();
-      if(!r.ok) throw new Error(data.error||"failed");
+      const r = await fetch("/strip", {method:"POST", body:fd, signal:ctrl.signal});
+      data = await r.json();
+      if(!r.ok) throw new Error(data.error || "failed");
     }catch(err){
-      status.textContent="✕ "+err.message; status.style.color="var(--safelight)"; return;
+      stopTicker();
+      let msg;
+      if(err.name === "AbortError"){
+        msg = `timed out after ${REQUEST_TIMEOUT_MS/1000}s — try a smaller photo`;
+      }else if(err instanceof SyntaxError){
+        // r.json() choked: we got an HTML error page from the proxy/load
+        // balancer rather than a response from the app itself.
+        msg = "server returned an error page, not JSON — the app may be down";
+      }else{
+        msg = err.message;
+      }
+      status.innerHTML = "✕ " + msg;
+      status.style.color = "var(--safelight)";
+      return;
+    }finally{
+      clearTimeout(abortAt);
     }
+
+    stopTicker();
     hide(status);
     renderFindings(data);
+  }
+
+  // Two response shapes, because there are two deployments.
+  //   download_url -> AWS: a short-lived presigned S3 link.
+  //   image_b64    -> everywhere else: the bytes themselves, never stored server
+  //                   side, turned into a Blob so the browser can save them.
+  function setDownload(data){
+    if(objectUrl){ URL.revokeObjectURL(objectUrl); objectUrl = null; }
+
+    if(data.download_url){
+      download.href = data.download_url;
+      download.removeAttribute("download");
+      return;
+    }
+    if(data.image_b64){
+      const bin = atob(data.image_b64);
+      const buf = new Uint8Array(bin.length);
+      for(let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      objectUrl = URL.createObjectURL(new Blob([buf], {type: data.mime || "image/jpeg"}));
+      download.href = objectUrl;
+      download.setAttribute("download", data.filename || "obscura.jpg");
+    }
   }
 
   function renderFindings(data){
@@ -179,13 +239,15 @@
       const after=entries.length*180+500;
       setTimeout(()=>{
         verdict.innerHTML=`✔ Redacted ${total} hidden tag${total===1?"":"s"}. Your clean copy carries nothing.`;
-        download.href=data.download_url; show(download); show(again);
+        setDownload(data); show(download); show(again);
       }, after);
     }, entries.length*90+400);
   }
 
   again.addEventListener("click",reset);
   function reset(){
+    stopTicker();
+    if(objectUrl){ URL.revokeObjectURL(objectUrl); objectUrl = null; }
     [exposed,download,again].forEach(hide);
     rows.innerHTML=""; verdict.textContent=""; status.style.color="var(--amber)";
     file.value="";

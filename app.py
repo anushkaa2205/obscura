@@ -1,28 +1,69 @@
+import base64
 import io
 import os
 import uuid
 
-import boto3
 import piexif
 from flask import Flask, request, jsonify, render_template
 from PIL import Image
 
 app = Flask(__name__)
 
-# Cap uploads so a huge file can't exhaust a t3.micro's memory (1 GB RAM).
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
-
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
-BUCKET = os.environ.get("BUCKET_NAME")  # set on the EC2 instance via docker -e
+BUCKET = os.environ.get("BUCKET_NAME")  # set on EC2 via `docker -e`; unset elsewhere
 
-# boto3 automatically uses the EC2 instance's IAM role — no keys stored anywhere.
-# endpoint_url is pinned to the regional S3 endpoint: without it, this botocore
-# version signs presigned URLs against the global s3.amazonaws.com host, which
-# 307-redirects non-us-east-1 buckets to the regional host and breaks the
-# signature (Host is a signed header) - the download link 403s for every user.
-s3 = boto3.client(
-    "s3", region_name=REGION, endpoint_url=f"https://s3.{REGION}.amazonaws.com"
-)
+# ---------------------------------------------------------------------------
+# Two storage modes, one codebase.
+#
+#   BUCKET set   -> AWS deployment. The clean copy goes to S3 under a random key
+#                   and comes back as a short-lived presigned URL. This is
+#                   REQUIRED there: two EC2 instances sit behind the ALB, so the
+#                   download request may well land on the instance that didn't
+#                   process the upload. Shared storage is the only correct answer.
+#
+#   BUCKET unset -> single-service deployment (Cloud Run, plain docker, local).
+#                   There is no second instance to hand off to, so the clean copy
+#                   is returned inline in the response and never persisted at
+#                   all - not to disk, not to a bucket, not to a cache. Strictly
+#                   stronger privacy than the S3 path, which keeps the cleaned
+#                   file for up to a day before the lifecycle rule expires it.
+#
+# boto3 is imported lazily so a container running without a bucket never touches
+# AWS credential resolution - which otherwise stalls on the EC2 metadata endpoint.
+# ---------------------------------------------------------------------------
+if BUCKET:
+    import boto3
+    from botocore.config import Config
+
+    # endpoint_url is pinned to the regional S3 endpoint: without it, this
+    # botocore version signs presigned URLs against the global s3.amazonaws.com
+    # host, which 307-redirects non-us-east-1 buckets to the regional host and
+    # breaks the signature (Host is a signed header) - the download link 403s
+    # for every user.
+    #
+    # The timeouts matter as much as the endpoint. On defaults, an unreachable
+    # or misnamed bucket leaves boto3 retrying for minutes while the gunicorn
+    # worker is held hostage and the browser sits on a spinner. Fail in seconds
+    # and return a real error instead.
+    s3 = boto3.client(
+        "s3",
+        region_name=REGION,
+        endpoint_url=f"https://s3.{REGION}.amazonaws.com",
+        config=Config(
+            connect_timeout=5,
+            read_timeout=15,
+            retries={"max_attempts": 2},
+        ),
+    )
+else:
+    s3 = None
+
+# Direct mode returns the image inline as base64 (~1.33x the byte size), so cap
+# it lower to stay well inside Cloud Run's 32 MB response ceiling. S3 mode only
+# ever returns a URL, so it can afford the original 25 MB.
+_DEFAULT_CAP_MB = 25 if BUCKET else 10
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", _DEFAULT_CAP_MB))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
 def _ratio(x):
@@ -87,7 +128,7 @@ def read_metadata(raw):
     gps = parse_gps(exif_dict)
     if gps:
         found["GPS location"] = f"{gps['lat']}, {gps['lon']}"
-        found["_gps"] = gps  # used by the frontend map link
+        found["_gps"] = gps  # never sent to the client; see summarize_findings
 
     return found, total
 
@@ -124,7 +165,7 @@ def strip_metadata(raw):
 
 @app.errorhandler(413)
 def too_large(_e):
-    return jsonify({"error": "File too large (25 MB max)"}), 413
+    return jsonify({"error": f"File too large ({MAX_UPLOAD_MB} MB max)"}), 413
 
 
 def summarize_findings(found):
@@ -169,22 +210,34 @@ def strip():
         return jsonify({"error": f"Could not process image: {e}"}), 400
 
     ext = "jpg" if fmt == "JPEG" else fmt.lower()
-    key = f"clean/{uuid.uuid4().hex}.{ext}"  # random, unguessable
+    mime = "image/jpeg" if fmt == "JPEG" else f"image/{ext}"
     orig_name = os.path.splitext(os.path.basename(f.filename or "photo"))[0]
 
+    # NOTE: we deliberately never log `found` — that would leak GPS into
+    # CloudWatch / Cloud Logging. We also never send the real values to the
+    # browser — see summarize_findings.
+    payload = {"found": summarize_findings(found), "stripped_count": total}
+
+    if not BUCKET:
+        # Direct mode: the clean copy goes straight back down the wire. It exists
+        # in this response and nowhere else — there is no object to expire, no
+        # key to guess, and no bucket policy to get wrong.
+        payload["image_b64"] = base64.b64encode(clean_bytes).decode("ascii")
+        payload["filename"] = f"obscura_{orig_name}.{ext}"
+        payload["mime"] = mime
+        return jsonify(payload)
+
+    key = f"clean/{uuid.uuid4().hex}.{ext}"  # random, unguessable
     try:
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=key,
-            Body=clean_bytes,
-            ContentType=f"image/{ext}",
-        )
-        download_url = s3.generate_presigned_url(
+        s3.put_object(Bucket=BUCKET, Key=key, Body=clean_bytes, ContentType=mime)
+        payload["download_url"] = s3.generate_presigned_url(
             "get_object",
             Params={
                 "Bucket": BUCKET,
                 "Key": key,
-                "ResponseContentDisposition": f'attachment; filename="obscura_{orig_name}.{ext}"',
+                "ResponseContentDisposition": (
+                    f'attachment; filename="obscura_{orig_name}.{ext}"'
+                ),
             },
             ExpiresIn=900,  # 15 min — was 5, too easy to let the link go stale mid-demo
         )
@@ -193,16 +246,9 @@ def strip():
         # AWS XML page if S3 is unreachable or the presigned URL fails to build.
         return jsonify({"error": f"Upload to storage failed: {e}"}), 502
 
-    # NOTE: we deliberately never log `found` — that would leak GPS into CloudWatch.
-    # We also never send the real values to the browser — see summarize_findings.
-    return jsonify(
-        {
-            "found": summarize_findings(found),
-            "stripped_count": total,
-            "download_url": download_url,
-        }
-    )
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Cloud Run injects PORT; everything else defaults to 8080.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
