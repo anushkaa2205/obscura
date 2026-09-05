@@ -8,12 +8,6 @@ You take a photo — nothing dangerous in frame, no faces, no address — and up
 
 ---
 
-## Live demo
-
-**http://obscura-alb-855727591.ap-south-1.elb.amazonaws.com/**
-
-> This is served directly over HTTP for now. HTTPS via CloudFront is built and ready to switch on once AWS account verification clears.
-
 ## How to test it
 
 The point of Obscura is only provable if your test photo actually *has* metadata to strip. A few platforms (WhatsApp, Instagram, Telegram) already strip EXIF data before you ever see the image, so testing with a photo that passed through one of those will show nothing — that's the app working correctly, not failing.
